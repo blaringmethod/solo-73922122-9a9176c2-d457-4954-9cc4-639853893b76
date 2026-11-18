@@ -5,6 +5,7 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 
+import psycopg.errors
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
@@ -29,8 +30,12 @@ manager = SessionManager(settings)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     manager.start()
-    yield
-    manager.stop()
+    try:
+        yield
+    finally:
+        # 停机走 manager.stop() 的有序流程：先关写入口、等在途写结束，
+        # 再关闭连接池。stop 内有阻塞等待，放到线程池避免卡住事件循环。
+        await asyncio.to_thread(manager.stop)
 
 
 app = FastAPI(
@@ -58,6 +63,18 @@ async def session_error_handler(request: Request, exc: SessionError):
     )
 
 
+@app.exception_handler(psycopg.errors.IntegrityError)
+async def integrity_error_handler(request: Request, exc: psycopg.errors.IntegrityError):
+    # 写操作已被回滚，未提交；明确告诉调用方可以安全重试（修正入参后）
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": f"写请求被数据库拒绝（已回滚，未写入）：{exc.diag.message_primary or exc}",
+            "code": "write_rejected",
+        },
+    )
+
+
 def _session_info(s) -> SessionInfo:
     return SessionInfo(
         session_id=s.session_id,
@@ -76,7 +93,12 @@ def _session_info(s) -> SessionInfo:
 # ----------------------------------------------------------------------
 @app.get("/health", tags=["meta"], summary="健康检查")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        # 停机受理后为 false：可据此判断是否还应发送写请求
+        "accepting_writes": not manager.is_shutting_down(),
+        "pending_writes": manager.pending_writes(),
+    }
 
 
 @app.get("/meta", tags=["meta"], summary="服务参数（TTL、页上限、会话名额）")
@@ -86,7 +108,37 @@ def meta():
         "session_ttl_seconds": settings.session_ttl_seconds,
         "page_size_cap": settings.page_size_cap,
         "debug_hooks_enabled": settings.enable_debug_hooks,
+        "write_acquire_timeout_seconds": settings.write_acquire_timeout_seconds,
+        "shutdown_drain_timeout_seconds": settings.shutdown_drain_timeout_seconds,
+        "accepting_writes": not manager.is_shutting_down(),
     }
+
+
+@app.post(
+    "/admin/shutdown",
+    tags=["admin"],
+    summary="[调试] 受理停机（关闭写入口并有序收尾；仅 ENABLE_DEBUG_HOOKS=true）",
+    responses={404: {"description": "调试钩子未开启"}},
+)
+async def debug_shutdown():
+    """演示/自测辅助：受理一次停机。
+
+    与 SIGTERM 的差别：SIGTERM 由 uvicorn 先让在途 HTTP 请求跑完再收尾；
+    本接口无法让命令行 uvicorn 进程退出，因此立即开始有序收尾
+    （等在途写 → 关会话 → 关池）。生产环境请使用 SIGTERM / `docker stop`。
+    """
+    if not settings.enable_debug_hooks:
+        raise HTTPException(status_code=404, detail="调试钩子未开启")
+    # 同步关闭写入口，让"停机受理"立刻对并发写请求可见
+    manager.begin_shutdown()
+    server = getattr(app.state, "uvicorn_server", None)
+    if server is not None:
+        # 若宿主把 uvicorn.Server 挂到 app.state，则走与 SIGTERM 相同的路径
+        server.should_exit = True
+    else:
+        # 未挂载 Server：自行完成有序收尾，处理完本请求后停止接受写入
+        asyncio.get_running_loop().create_task(asyncio.to_thread(manager.stop))
+    return {"status": "shutdown_initiated"}
 
 
 # ----------------------------------------------------------------------
@@ -194,27 +246,54 @@ async def fetch_claims(
 
 # ----------------------------------------------------------------------
 # 源端补录接口（对应 db/init/03_sql_examples.sql 的 SQL 示例）
-# 池连接为自动提交模式：单条写语句执行即提交，不触碰任何会话快照。
+# 写操作统一走 manager.run_write：停机时在执行 SQL 前拒绝，
+# 已借到连接的写入提交成功才返回成功，失败则回滚并明确报错。
 # ----------------------------------------------------------------------
+def _write_debug_delay(request: Request) -> float:
+    """自测/演示钩子：返回写请求执行 SQL 前的暂停秒数。
+
+    延迟发生在"已借到连接、尚未执行 SQL"的窗口内，用于制造
+    "写入进行中恰逢停机"的交错。仅 ENABLE_DEBUG_HOOKS=true 时生效。
+    """
+    if not settings.enable_debug_hooks:
+        return 0.0
+    raw = request.headers.get("x-debug-write-delay-seconds")
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, min(30.0, float(raw)))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="非法的调试延迟头")
+
+
+def _call_write(operation, delay: float):
+    """在线程池中执行一次源端写操作（含可选的执行前暂停）。"""
+    if delay > 0:
+        def _delayed(conn):
+            time.sleep(delay)
+            return operation(conn)
+        return manager.run_write(_delayed)
+    return manager.run_write(operation)
+
+
 @app.post(
     "/admin/policies",
     response_model=PolicyOut,
     status_code=201,
     tags=["admin"],
     summary="补录保单（源端写操作，照常提交）",
+    responses={503: {"model": Message, "description": "服务停机中，写请求未执行"}},
 )
-async def create_policy(body: PolicyIn):
-    def _insert():
-        conn = manager.pool().getconn()
-        try:
-            return conn.execute(
-                "INSERT INTO policies (region) VALUES (%s) RETURNING id, region",
-                (body.region,),
-            ).fetchone()
-        finally:
-            manager.pool().putconn(conn)
+async def create_policy(body: PolicyIn, request: Request):
+    def _insert(conn):
+        return conn.execute(
+            "INSERT INTO policies (region) VALUES (%s) RETURNING id, region",
+            (body.region,),
+        ).fetchone()
 
-    row = await asyncio.to_thread(_insert)
+    row = await asyncio.to_thread(
+        _call_write, _insert, _write_debug_delay(request)
+    )
     return PolicyOut(**row)
 
 
@@ -224,20 +303,19 @@ async def create_policy(body: PolicyIn):
     status_code=201,
     tags=["admin"],
     summary="补录理赔（源端写操作，照常提交）",
+    responses={503: {"model": Message, "description": "服务停机中，写请求未执行"}},
 )
-async def create_claim(body: ClaimIn):
-    def _insert():
-        conn = manager.pool().getconn()
-        try:
-            return conn.execute(
-                "INSERT INTO claims (policy_id, amount) VALUES (%s, %s) "
-                "RETURNING id, policy_id, amount",
-                (body.policy_id, body.amount),
-            ).fetchone()
-        finally:
-            manager.pool().putconn(conn)
+async def create_claim(body: ClaimIn, request: Request):
+    def _insert(conn):
+        return conn.execute(
+            "INSERT INTO claims (policy_id, amount) VALUES (%s, %s) "
+            "RETURNING id, policy_id, amount",
+            (body.policy_id, body.amount),
+        ).fetchone()
 
-    row = await asyncio.to_thread(_insert)
+    row = await asyncio.to_thread(
+        _call_write, _insert, _write_debug_delay(request)
+    )
     return ClaimOut(**row)
 
 
@@ -246,20 +324,23 @@ async def create_claim(body: ClaimIn):
     response_model=ClaimOut,
     tags=["admin"],
     summary="修改理赔金额（源端写操作，照常提交）",
+    responses={503: {"model": Message, "description": "服务停机中，写请求未执行"}},
 )
-async def update_claim(claim_id: int, amount: int = Query(..., ge=0)):
-    def _update():
-        conn = manager.pool().getconn()
-        try:
-            return conn.execute(
-                "UPDATE claims SET amount = %s WHERE id = %s "
-                "RETURNING id, policy_id, amount",
-                (amount, claim_id),
-            ).fetchone()
-        finally:
-            manager.pool().putconn(conn)
+async def update_claim(
+    claim_id: int,
+    request: Request,
+    amount: int = Query(..., ge=0),
+):
+    def _update(conn):
+        return conn.execute(
+            "UPDATE claims SET amount = %s WHERE id = %s "
+            "RETURNING id, policy_id, amount",
+            (amount, claim_id),
+        ).fetchone()
 
-    row = await asyncio.to_thread(_update)
+    row = await asyncio.to_thread(
+        _call_write, _update, _write_debug_delay(request)
+    )
     if row is None:
         raise HTTPException(status_code=404, detail=f"理赔 {claim_id} 不存在")
     return ClaimOut(**row)
@@ -270,18 +351,17 @@ async def update_claim(claim_id: int, amount: int = Query(..., ge=0)):
     status_code=204,
     tags=["admin"],
     summary="删除理赔（源端写操作，照常提交）",
+    responses={503: {"model": Message, "description": "服务停机中，写请求未执行"}},
 )
-async def delete_claim(claim_id: int):
-    def _delete():
-        conn = manager.pool().getconn()
-        try:
-            return conn.execute(
-                "DELETE FROM claims WHERE id = %s RETURNING id", (claim_id,)
-            ).fetchone()
-        finally:
-            manager.pool().putconn(conn)
+async def delete_claim(claim_id: int, request: Request):
+    def _delete(conn):
+        return conn.execute(
+            "DELETE FROM claims WHERE id = %s RETURNING id", (claim_id,)
+        ).fetchone()
 
-    row = await asyncio.to_thread(_delete)
+    row = await asyncio.to_thread(
+        _call_write, _delete, _write_debug_delay(request)
+    )
     if row is None:
         raise HTTPException(status_code=404, detail=f"理赔 {claim_id} 不存在")
     # 204 必须无响应体

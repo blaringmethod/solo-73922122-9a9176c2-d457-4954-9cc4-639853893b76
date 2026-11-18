@@ -397,5 +397,265 @@ class TestConnectionLossAndRestart(ApiTestBase):
         self.close(s2["session_id"])
 
 
+class TestShutdownWriteHandoff(ApiTestBase):
+    """源端写请求与服务停机的交接语义。
+
+    直接驱动 manager.begin_shutdown()/stop()，从而精确控制
+    "停机受理"与"写入进行中"的交错时序；服务用 start() 恢复。
+    """
+
+    def tearDown(self):
+        # 无论用例成败都恢复服务并核对没有遗留的在途写
+        manager.start()
+        deadline = time.time() + 5
+        while manager.pending_writes() and time.time() < deadline:
+            time.sleep(0.05)
+
+    def _counts(self):
+        with psycopg.connect(settings.database_url, autocommit=True) as conn:
+            policies = conn.execute("SELECT count(*) FROM policies").fetchone()[0]
+            claims = conn.execute("SELECT count(*) FROM claims").fetchone()[0]
+        return policies, claims
+
+    def _start_write_with_delay(self, delay, body=None):
+        """发起一个写请求；服务端借到连接后、执行 SQL 前会暂停 delay 秒。"""
+        box = {}
+
+        def run():
+            box["resp"] = self.client.post(
+                "/admin/claims",
+                json=body or {"policy_id": 1, "amount": 4321},
+                headers={"X-Debug-Write-Delay-Seconds": str(delay)},
+                timeout=30,
+            )
+
+        t = threading.Thread(target=run)
+        t.start()
+        # 等到服务端真的把该写请求登记为在途（已借到连接）再返回
+        deadline = time.time() + 10
+        while manager.pending_writes() != 1 and time.time() < deadline:
+            time.sleep(0.02)
+        return t, box
+
+    def test_inflight_write_commits_and_returns_success_across_shutdown(self):
+        """已借到连接的写入：停机后仍应完成提交，且必须返回成功。"""
+        before = self._counts()
+        t, box = self._start_write_with_delay(2.0)
+        time.sleep(0.5)  # 写请求已借到连接、处于"执行前"窗口
+        self.assertFalse(manager.is_shutting_down())
+
+        # 模拟 uvicorn 收到停机信号：关闭写入口并完整收尾
+        manager.begin_shutdown()
+        self.assertTrue(manager.is_shutting_down())
+        manager.stop()
+
+        t.join(timeout=20)
+        self.assertIn("resp", box, "写请求没有返回")
+        resp = box["resp"]
+        # 已提交的写入必须返回成功，绝不能报错却已写入
+        self.assertEqual(resp.status_code, 201, resp.text)
+        new_claim_id = resp.json()["id"]
+
+        after = self._counts()
+        self.assertEqual(after[1], before[1] + 1, "响应成功则必须确实写入")
+
+        # 重启后能按 id 查到这条记录：证明提交成功、不是假成功
+        manager.start()
+        self.assertTrue(manager.is_shutting_down() is False)
+        with psycopg.connect(settings.database_url, autocommit=True) as conn:
+            row = conn.execute(
+                "SELECT id, amount FROM claims WHERE id = %s", (new_claim_id,)
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[1], 4321)
+
+    def test_write_after_shutdown_accepted_is_rejected_without_writing(self):
+        """停机受理后到达的写请求：明确失败且不写入任何数据。"""
+        before = self._counts()
+        manager.begin_shutdown()
+        resp = self.client.post(
+            "/admin/claims", json={"policy_id": 1, "amount": 999}
+        )
+        self.assertEqual(resp.status_code, 503, resp.text)
+        self.assertEqual(resp.json()["code"], "service_shutting_down")
+        self.assertEqual(self._counts(), before, "被拒绝的写请求绝不能写入数据")
+
+        # 改金额/删除/补录保单同样被拒绝且不落库
+        self.assertEqual(
+            self.client.patch("/admin/claims/1", params={"amount": 1}).status_code,
+            503,
+        )
+        self.assertEqual(self.client.delete("/admin/claims/1").status_code, 503)
+        self.assertEqual(
+            self.client.post("/admin/policies", json={"region": "西南"}).status_code,
+            503,
+        )
+        self.assertEqual(self._counts(), before)
+
+        # 恢复后写入照常
+        manager.start()
+        self.assertEqual(
+            self.client.post(
+                "/admin/claims", json={"policy_id": 1, "amount": 123}
+            ).status_code,
+            201,
+        )
+
+    def test_queued_write_ends_wait_and_never_commits_after_restart(self):
+        """等连接的写请求遇停机：结束等待并失败，重启后也不会意外提交。"""
+        pool = manager.pool()
+        # 把池全部连接借走，制造"写请求只能排队等连接"的局面
+        held = []
+        try:
+            while True:
+                try:
+                    held.append(pool.getconn(timeout=0.2))
+                except Exception:
+                    break
+        except Exception:
+            pass
+        self.assertGreaterEqual(len(held), 1)
+
+        before = self._counts()
+        box = {}
+
+        def queued_write():
+            box["resp"] = self.client.post(
+                "/admin/claims", json={"policy_id": 1, "amount": 2468},
+                timeout=30,
+            )
+            box["returned_at"] = time.time()
+
+        t = threading.Thread(target=queued_write)
+        t.start()
+        time.sleep(0.6)  # 让请求进入排队等待连接的状态
+        self.assertEqual(manager.pending_writes(), 1, "写请求应处于等待连接中")
+
+        t_begin = time.time()
+        manager.begin_shutdown()
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive(), "停机后写请求不应继续等待连接")
+        self.assertLess(box["returned_at"] - t_begin, 3.0, "等待应被立即结束")
+        self.assertEqual(box["resp"].status_code, 503, box["resp"].text)
+        self.assertIn(
+            box["resp"].json()["code"],
+            ("write_interrupted_by_shutdown", "service_shutting_down"),
+        )
+
+        # 释放占用的连接、完整停机并重启
+        for conn in held:
+            pool.putconn(conn)
+        held.clear()
+        manager.stop()
+        manager.start()
+        # 再等一会：此前排队的写请求绝不能在重启后才拿到连接并提交
+        time.sleep(0.5)
+        self.assertEqual(self._counts(), before, "被停机打断的写请求不得写入数据")
+
+    def test_stop_waits_for_inflight_write_before_closing_pool(self):
+        """stop() 必须先等在途写结束再关池，否则归还连接会失败。"""
+        t, box = self._start_write_with_delay(2.0)
+        # 等到该写请求确实已借到连接（登记为在途）再开始停机
+        deadline = time.time() + 10
+        while manager.pending_writes() != 1 and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(manager.pending_writes(), 1, "写请求未进入在途状态")
+        stop_started = time.time()
+        manager.stop()
+        stop_duration = time.time() - stop_started
+        t.join(timeout=20)
+        # stop 阻塞等待了在途写请求，且该写请求返回成功
+        self.assertGreater(stop_duration, 1.0, "stop 未等待在途写请求")
+        self.assertEqual(box["resp"].status_code, 201, box["resp"].text)
+
+    def test_failed_write_is_explicit_failure_and_not_committed(self):
+        """写操作执行出错时：明确失败且不落库（不会报错却已写入）。"""
+        before = self._counts()
+        # policy_id 不存在 -> 外键错误
+        resp = self.client.post(
+            "/admin/claims", json={"policy_id": 99999999, "amount": 100}
+        )
+        self.assertGreaterEqual(resp.status_code, 400)
+        self.assertLess(resp.status_code, 600)
+        self.assertNotEqual(resp.status_code, 201)
+        self.assertEqual(self._counts(), before)
+
+    def test_sessions_remain_usable_during_and_across_shutdown(self):
+        """原有快照会话的分页、关闭与并行写入在停机前后保持可用。"""
+        s = self.open("华东")
+        sid = s["session_id"]
+        first = self.page(sid, page_size=10)
+        self.assertEqual(first.status_code, 200)
+        ids_before = [r["claim_id"] for r in first.json()["rows"]]
+
+        # 停机受理后、stop() 之前：既有会话仍可继续分页与状态查询
+        manager.begin_shutdown()
+        self.assertEqual(self.page(sid, page_size=10).status_code, 200)
+        self.assertEqual(
+            self.client.get(f"/sessions/{sid}").status_code, 200
+        )
+        # 并行传入的写请求被拒绝，但不影响会话取页
+        self.assertEqual(
+            self.client.post(
+                "/admin/claims", json={"policy_id": 1, "amount": 10}
+            ).status_code,
+            503,
+        )
+        self.assertEqual(self.page(sid, page_size=10).status_code, 200)
+
+        # 完整停机：会话被关闭，取页失败且不返回明细
+        manager.stop()
+        after_stop = self.page(sid)
+        self.assertIn(after_stop.status_code, (404, 409, 410))
+        self.assertNotIn("rows", after_stop.json())
+
+        # 重启后可正常开新会话，且能看到停机前提交的数据
+        manager.start()
+        s2 = self.open("华东")
+        fresh = self.page(s2["session_id"], page_size=10)
+        self.assertEqual(fresh.status_code, 200)
+        self.assertEqual(len(fresh.json()["rows"]), 10)
+        self.close(s2["session_id"])
+
+    def test_write_is_atomic_even_if_statement_then_error(self):
+        """写操作内部先执行语句再抛错：整笔回滚，不得出现报错却已写入。
+
+        回归用例：连接池连接默认 autocommit=True，若不做显式事务，
+        已执行的语句会立即提交，异常回滚也无法撤销。
+        """
+        with psycopg.connect(settings.database_url, autocommit=True) as conn:
+            before = conn.execute("SELECT count(*) FROM claims").fetchone()[0]
+
+        def boom(conn):
+            conn.execute(
+                "INSERT INTO claims (policy_id, amount) VALUES (1, 1)"
+            )
+            raise RuntimeError("simulated failure after statement")
+
+        with self.assertRaises(RuntimeError):
+            manager.run_write(boom)
+
+        with psycopg.connect(settings.database_url, autocommit=True) as conn:
+            after = conn.execute("SELECT count(*) FROM claims").fetchone()[0]
+        self.assertEqual(after, before, "出错写请求的语句不得被提交")
+
+    def test_writes_work_normally_when_not_shutting_down(self):
+        """非停机状态下源端写请求照常提交，快照会话仍隔离。"""
+        s = self.open("华北")
+        sid = s["session_id"]
+        before = self.page(sid, page_size=100).json()
+        resp = self.client.post(
+            "/admin/claims", json={"policy_id": 1, "amount": 555}
+        )
+        self.assertEqual(resp.status_code, 201, resp.text)
+        # 会话快照不受源端写影响
+        after = self.page(sid, page_size=100).json()
+        self.assertEqual(
+            [r["claim_id"] for r in before["rows"]],
+            [r["claim_id"] for r in after["rows"]],
+        )
+        self.close(sid)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

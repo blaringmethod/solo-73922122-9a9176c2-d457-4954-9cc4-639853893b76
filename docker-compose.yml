@@ -17,6 +17,11 @@ services:
       timeout: 3s
       retries: 20
 
+  # 停机与写入交错的演示在宿主机上运行（需对 docker compose 发 stop/start）：
+  #   DEMO_SHUTDOWN_CMD="docker compose stop api" \
+  #   DEMO_STARTUP_CMD="docker compose start api"  python3 demo/demo.py
+  # 详见 README「停机与写入交错演示」。刻意不挂载 docker.sock 到容器内。
+
   api:
     build: .
     depends_on:
@@ -29,8 +34,17 @@ services:
       PAGE_SIZE_CAP: "100"
       # 开启后可用 X-Debug-Sleep-Seconds 头制造慢取页，供演示使用
       ENABLE_DEBUG_HOOKS: "true"
+      # 写请求借连接的等待上限；超时明确失败（未执行 SQL）
+      WRITE_ACQUIRE_TIMEOUT_SECONDS: "10"
+      # 停机时等待在途写请求提交/回滚的上限；须小于 Dockerfile 的
+      # uvicorn --timeout-graceful-shutdown (30s)
+      SHUTDOWN_DRAIN_TIMEOUT_SECONDS: "15"
     ports:
       - "8000:8000"
+    # signal 默认 SIGTERM 即为优雅停机；显式声明便于阅读
+    stop_signal: SIGTERM
+    # 给在途写请求留足提交时间，避免被 docker stop 的超时 SIGKILL 打断
+    stop_grace_period: 40s
 
 volumes:
   pgdata:

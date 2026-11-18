@@ -15,6 +15,16 @@ def _int_env(name: str, default: int) -> int:
     return value
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = float(raw)
+    if value <= 0:
+        raise ValueError(f"{name} 必须为正数，实际为 {raw!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url: str
@@ -25,6 +35,10 @@ class Settings:
     enable_debug_hooks: bool
     pool_min_size: int
     pool_max_size: int
+    # 写请求借连接的最长等待时间；超时则明确失败（不执行 SQL）。
+    write_acquire_timeout_seconds: float
+    # 停机时等待已借到连接的写请求提交/回滚的最长时间。
+    shutdown_drain_timeout_seconds: float
 
     @staticmethod
     def from_env() -> "Settings":
@@ -45,6 +59,12 @@ class Settings:
             in ("1", "true", "yes", "on"),
             pool_min_size=_int_env("POOL_MIN_SIZE", 1),
             pool_max_size=_int_env("POOL_MAX_SIZE", 10),
+            write_acquire_timeout_seconds=_float_env(
+                "WRITE_ACQUIRE_TIMEOUT_SECONDS", 10.0
+            ),
+            shutdown_drain_timeout_seconds=_float_env(
+                "SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 15.0
+            ),
         )
 
 

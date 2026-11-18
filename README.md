@@ -38,6 +38,29 @@ docker compose up --build
 | 不影响另一会话/后续新会话 | 名额只统计 open/closing 会话；终态不占名额，连接归还池后立即可复用 |
 | 连接丢失/服务重启后旧会话失效 | 会话状态只存进程内存；连接断裂的会话作废返回 503 且绝不换快照续取；重启后旧 id 查询 404 |
 
+### 停机与源端写入的交接
+
+写入接口统一经 `manager.run_write()`，用"准入闸门 + 在途计数"与停机交接：
+
+| 时序 | 行为 |
+| --- | --- |
+| 停机受理**后**到达的写请求 | 在执行任何 SQL **之前**即被拒绝，返回 `503 service_shutting_down`，数据库无任何变更，可安全重试 |
+| 停机时**已借到连接**的写请求 | 不被打断：执行完自己的语句并确认已提交，**返回成功后才归还连接**；绝不出现"报错却已写入" |
+| 写操作执行出错 | 显式回滚，返回明确失败（外键等约束冲突为 `409 write_rejected`），不会写入 |
+| 停机时**正在排队等连接**的写请求 | 等待被立即打断，返回 `503 write_interrupted_by_shutdown`，未执行 SQL；**不会在重启后才拿到连接意外提交** |
+| `stop()` 收尾顺序 | ① 关写入口 → ② 等已借到连接的写请求提交/回滚并归还（上限 `SHUTDOWN_DRAIN_TIMEOUT_SECONDS`）→ ③ 关闭快照会话 → ④ 最后关闭连接池 |
+
+`stop()` 一定在关闭连接池**之前**等在途写结束，因此归还连接时池仍然可用；
+即使 drain 超时，`pool.close()` 也只会在连接归还时关闭它，不会打断已开始的提交。
+
+> 与容器停机的配合：Dockerfile 里 uvicorn 使用 `--timeout-graceful-shutdown 30`，
+> compose 里 `stop_grace_period: 40s`，均大于 `SHUTDOWN_DRAIN_TIMEOUT_SECONDS`，
+> 保证 `docker stop` / `compose down` 不会在写请求提交前用 SIGKILL 打断。
+> uvicorn 收到 SIGTERM 会先让在途 HTTP 请求跑完，再进入 lifespan shutdown（即 `manager.stop()`）。
+
+服务健康检查 `/health` 返回 `accepting_writes` 与 `pending_writes`，可在停机受理后
+据此停止发送新的写请求。
+
 ### 会话状态机
 
 ```
@@ -61,7 +84,8 @@ open ──主动关闭──▶ closing ──回滚事务/还连接/释放名�
 | POST | `/admin/claims` | 源端补录理赔 |
 | PATCH | `/admin/claims/{id}?amount=999` | 源端改金额 |
 | DELETE | `/admin/claims/{id}` | 源端删除理赔 |
-| GET | `/health`、`/meta` | 健康检查、服务参数 |
+| GET | `/health`、`/meta` | 健康检查（含 `accepting_writes`/`pending_writes`）、服务参数 |
+| POST | `/admin/shutdown` | **[调试]** 受理一次停机（关闭写入口并有序收尾）；仅 `ENABLE_DEBUG_HOOKS=true` 时可用，生产请用 SIGTERM |
 
 取页失败响应只含 `detail`/`code`，不含任何明细行：
 
@@ -71,10 +95,21 @@ HTTP 409
  "code": "session_not_open"}
 ```
 
-## 四、慢取页演示
+写入失败同样只含 `detail`/`code`，并明确区分"未执行"与"已回滚"：
 
-镜像默认 `ENABLE_DEBUG_HOOKS=true`，带 `X-Debug-Sleep-Seconds` 请求头
-可让本次取页在执行 SQL 前先睡眠，用于演示"关闭及时受理"：
+```json
+HTTP 503
+{"detail": "服务正在停机，写请求未被执行（未写入任何数据），可安全地在服务恢复后重试",
+ "code": "service_shutting_down"}
+```
+
+## 四、停机与写入交错演示
+
+镜像默认 `ENABLE_DEBUG_HOOKS=true`：
+
+- `X-Debug-Sleep-Seconds`：让本次**取页**在执行 SQL 前先睡眠，演示"关闭及时受理"。
+- `X-Debug-Write-Delay-Seconds`：让**写请求**在已借到连接、执行 SQL 前暂停，
+  用于制造"写入进行中恰逢停机"的交错。
 
 ```bash
 python3 demo/demo.py                 # 完整端到端演示（标准库即可运行）
@@ -83,7 +118,35 @@ DEMO_TTL_WAIT=1 python3 demo/demo.py # 追加等待到期场景（约多花 1 �
 ```
 
 演示覆盖：分页与重复取页一致性、源端写入的快照隔离、名额满 429、
-慢取页期间关闭（在途请求结束后失败、无明细）、到期失效。
+慢取页期间关闭（在途请求结束后失败、无明细）、到期失效，以及
+**停机与写入交错**（场景 5）。
+
+### 真实停机交错（docker compose）
+
+```bash
+# 终端 A：启动服务
+docker compose up --build
+
+# 终端 B：跑演示，并在场景 5 真实停/启 api 容器
+pip install psycopg[binary]          # 可选：用于直连数据库核对行数
+DEMO_SHUTDOWN_CMD="docker compose stop api" \
+DEMO_STARTUP_CMD="docker compose start api" \
+DATABASE_URL=postgresql://actuary:actuary@127.0.0.1:55432/claims \
+python3 demo/demo.py
+```
+
+场景 5 做三件事，并逐项断言：
+
+1. 发起一个"已借到连接、3 秒后执行 SQL"的写请求；
+2. 在其执行期间 `docker compose stop api`（SIGTERM → 优雅停机）；
+3. 校验：该写请求返回 **201**，且重启后按返回的 id 能查到记录（确认真实提交）；
+   停机后再发的写请求返回 **503** 且行数不变。
+
+若 `DEMO_SHUTDOWN_CMD` 执行失败（如无 docker 环境），演示会改用
+`POST /admin/shutdown` 触发同一套停机收尾流程，并明确标注为替代方式
+（该接口无法让命令行 uvicorn 进程退出，仅关闭写入口并收尾；真实演示请用
+`docker compose stop`）。**注意**：`/admin/shutdown` 是调试接口，
+生产环境请用 SIGTERM / `docker stop`。
 
 ## 五、本地自测（无 Docker 时）
 
@@ -97,9 +160,12 @@ SESSION_TTL_SECONDS=2 ENABLE_DEBUG_HOOKS=true \
 python -m unittest tests.test_api -v
 ```
 
-15 个用例覆盖：分页/上限/参数校验、重复取页同快照、两表 JOIN 快照、
+22 个用例覆盖：分页/上限/参数校验、重复取页同快照、两表 JOIN 快照、
 源端增改删不可见、名额与释放、关闭幂等、慢取页+关闭竞争、
-到期清理、连接丢失作废不续取、服务重启旧会话 404。
+到期清理、连接丢失作废不续取、服务重启旧会话 404，以及停机交接：
+在途写入跨停机提交并返回成功、停机后写入被拒绝且不落库、
+排队写入被打断且重启后不提交、`stop()` 先等在途写再关池、
+写失败回滚不落库、停机前后快照会话仍可用。
 
 ## 六、配置项（环境变量）
 
@@ -109,8 +175,14 @@ python -m unittest tests.test_api -v
 | `MAX_SESSIONS` | `2` | 并发会话上限 |
 | `SESSION_TTL_SECONDS` | `60` | 会话存活秒数 |
 | `PAGE_SIZE_CAP` | `100` | 单页行数硬上限 |
-| `ENABLE_DEBUG_HOOKS` | `false`（compose 中为 true） | 是否允许慢取页调试头 |
+| `ENABLE_DEBUG_HOOKS` | `false`（compose 中为 true） | 是否允许慢取页/慢写入/停机调试钩子 |
 | `SWEEPER_INTERVAL_SECONDS` | `0.25` | 到期检查间隔 |
+| `WRITE_ACQUIRE_TIMEOUT_SECONDS` | `10` | 写请求借连接的最长等待；超时明确失败（未执行 SQL） |
+| `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `15` | 停机时等待在途写请求提交/回滚的上限 |
 
 > 说明：服务固定单 uvicorn worker——会话注册表与名额是进程内状态，
 > 多 worker 会各自持有独立状态，破坏会话语义。
+>
+> 停机相关：uvicorn 的 `--timeout-graceful-shutdown`（Dockerfile 中 30s）与
+> compose 的 `stop_grace_period`（40s）都应大于
+> `SHUTDOWN_DRAIN_TIMEOUT_SECONDS`，否则进程可能在写请求提交前被 SIGKILL。

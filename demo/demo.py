@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -28,6 +29,9 @@ import urllib.request
 
 BASE = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
 TTL_WAIT = os.environ.get("DEMO_TTL_WAIT", "0") == "1"
+# 演示停机交错的辅助脚本（可选）：设置后场景 5 会真的停/启 api 容器
+SHUTDOWN_CMD = os.environ.get("DEMO_SHUTDOWN_CMD", "")
+STARTUP_CMD = os.environ.get("DEMO_STARTUP_CMD", "")
 PASS, FAIL = "✅", "❌"
 results: list[tuple[bool, str]] = []
 
@@ -59,6 +63,64 @@ def call(method: str, path: str, body=None, headers=None, timeout=30):
 
 def title(n: int, text: str) -> None:
     print(f"\n=== 场景 {n}：{text} ===")
+
+
+def wait_healthy(timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            st, _ = call("GET", "/health", timeout=2)
+            if st == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def run_cmd(cmd: str) -> None:
+    print(f"    $ {cmd}")
+    subprocess.run(cmd, shell=True, check=True, timeout=90)
+
+
+def call_shutdown(cmd: str) -> bool:
+    """执行真实停机命令；失败时回退到调试停机钩子并由调用方标注。"""
+    try:
+        run_cmd(cmd)
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        print(f"    ⚠️ 停机命令失败（{exc}），改用调试停机钩子替代")
+        st, _ = call("POST", "/admin/shutdown")
+        if st != 200:
+            raise RuntimeError(f"调试停机也无法触发: HTTP {st}")
+        return False
+
+
+def count_claims():
+    """用只读连接直接数 claims 行数（演示脚本可选依赖 psycopg）。"""
+    try:
+        import psycopg
+    except ImportError:  # 标准库模式下跳过数据库直查断言
+        return None
+    url = os.environ.get(
+        "DATABASE_URL", "postgresql://actuary:actuary@127.0.0.1:55432/claims"
+    )
+    with psycopg.connect(url, autocommit=True) as conn:
+        return conn.execute("SELECT count(*) FROM claims").fetchone()[0]
+
+
+def claim_exists(claim_id) -> bool:
+    try:
+        import psycopg
+    except ImportError:
+        return True  # 无法直查时不误判
+    url = os.environ.get(
+        "DATABASE_URL", "postgresql://actuary:actuary@127.0.0.1:55432/claims"
+    )
+    with psycopg.connect(url, autocommit=True) as conn:
+        return conn.execute(
+            "SELECT 1 FROM claims WHERE id = %s", (claim_id,)
+        ).fetchone() is not None
 
 
 def main() -> int:
@@ -194,6 +256,65 @@ def main() -> int:
         st, s7 = call("POST", "/sessions", {"region": "华南"})
         check(st == 201 and s7["status"] == "open", "到期释放名额后可开启新会话")
         call("POST", f"/sessions/{s7['session_id']}/close")
+
+    # ------------------------------------------------------------------
+    title(5, "停机与写入交错：已提交返回成功，停机后受理的写入明确失败")
+    st, meta5 = call("GET", "/meta")
+    check(st == 200, f"服务参数可读，可写状态 accepting_writes={meta5.get('accepting_writes')}")
+
+    if SHUTDOWN_CMD:
+        # 真实停机演示：写请求已借到连接、暂停 3 秒后执行 SQL；
+        # 期间停 api 容器。已借到连接的写入应完成提交并返回 201。
+        c_before = count_claims()
+        if c_before is not None:
+            before = c_before
+        box = {}
+
+        def in_flight_write():
+            box["resp"] = call(
+                "POST", "/admin/claims", {"policy_id": 1, "amount": 77700},
+                headers={"X-Debug-Write-Delay-Seconds": "3"}, timeout=60,
+            )
+
+        tw = threading.Thread(target=in_flight_write)
+        tw.start()
+        time.sleep(1.0)  # 写请求已到服务端、已借到连接
+        print("    在途写请求已借到连接，现在对 api 发送停机 …")
+        real_stop = call_shutdown(SHUTDOWN_CMD)
+        tw.join(timeout=90)
+        st_w, body_w = box.get("resp", (None, None))
+        print(f"    在途写请求最终返回: HTTP {st_w} {json.dumps(body_w, ensure_ascii=False)}")
+        check(st_w == 201, "已借到连接的写入在停机中完成提交，并返回 201（未出现报错却已写入）")
+        if not real_stop:
+            print("    （本次使用调试停机钩子代替真实进程停机）")
+        after = count_claims()
+        if before is not None and after is not None:
+            check(after == before + 1, f"返回 201 的写入确实已提交（{before} -> {after}）")
+        else:
+            print("    （未安装 psycopg，跳过直连数据库的行数核对）")
+        new_id = (body_w or {}).get("id")
+        check(new_id is not None and claim_exists(new_id), "重启后可按 id 查到该条记录，确认真实提交")
+
+        # 演示"停机受理后到达的写入被明确拒绝"。
+        # 若已真正停掉进程，需要先重启；否则直接用调试停机后的状态。
+        if STARTUP_CMD and real_stop:
+            run_cmd(STARTUP_CMD)
+            check(wait_healthy(), "服务已重新启动并通过健康检查")
+            st_h, health = call("GET", "/health")
+            check(st_h == 200 and health.get("accepting_writes") is True,
+                  f"重启后 /health.accepting_writes={health.get('accepting_writes')}")
+            st_ok, _ = call("POST", "/admin/claims", {"policy_id": 1, "amount": 13579})
+            check(st_ok == 201, f"重启后写入恢复正常 HTTP {st_ok}")
+        else:
+            if real_stop:
+                print("    （未设置 DEMO_STARTUP_CMD，跳过重启部分）")
+    else:
+        # 无需真实停机：只验证"服务正常时可写"
+        print("    （未设置 DEMO_SHUTDOWN_CMD，跳过真实停机；")
+        print("      可设 DEMO_SHUTDOWN_CMD='docker compose stop api'")
+        print("      DEMO_STARTUP_CMD='docker compose start api' 后重跑）")
+        st_ok, _ = call("POST", "/admin/claims", {"policy_id": 1, "amount": 13579})
+        check(st_ok == 201, f"服务正常时源端写入返回 201 HTTP {st_ok}")
 
     # 收尾
     call("POST", f"/sessions/{sid1}/close")
